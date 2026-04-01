@@ -43,8 +43,10 @@ COLLECTION   = "statics_8th_edition"
 EMBED_MODEL  = "all-MiniLM-L6-v2"
 N_RESULTS    = 6
 MAX_HISTORY  = 10
+
+# Globals set during setup
 LLM_MODEL    = "qwen/qwen3.6-plus-preview:free"
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
+LLM_PROVIDER = "OpenRouter"
 
 console = Console()
 _latex  = LatexNodes2Text()
@@ -250,18 +252,36 @@ def build_rich_text(raw: str, render_math: bool) -> Group:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def setup():
-    if not OPENROUTER_API_KEY:
-        console.print(Panel(
-            "[bold red]OPENROUTER_API_KEY not set![/bold red]\n\n"
-            "1. Get free key → https://openrouter.ai\n"
-            "2. export OPENROUTER_API_KEY='sk-or-v1-...'",
-            title="[red]Auth Error[/red]", border_style="red"
-        ))
-        sys.exit(1)
+    global LLM_MODEL, LLM_PROVIDER
+    
+    console.print("\n╭─ [bold cyan]Select LLM Provider[/bold cyan]")
+    console.print("│ 1: [green]OpenRouter (Cloud)[/green] - qwen/qwen3.6-plus-preview:free")
+    console.print("│ 2: [yellow]Ollama (Local)[/yellow] - mightykatun/qwen2.5-math:1.5b")
+    
+    choice = Prompt.ask("╰─> [bold cyan]Choose an option[/bold cyan]", choices=["1", "2"], default="1")
+    
+    if choice == "1":
+        LLM_PROVIDER = "OpenRouter"
+        LLM_MODEL = "qwen/qwen3.6-plus-preview:free"
+        base_url = "https://openrouter.ai/api/v1"
+        api_key = os.environ.get("OPENROUTER_API_KEY", "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")
+        if not api_key:
+            console.print(Panel(
+                "[bold red]OPENROUTER_API_KEY not set![/bold red]\n\n"
+                "1. Get free key → https://openrouter.ai\n"
+                "2. export OPENROUTER_API_KEY='sk-or-v1-...'",
+                title="[red]Auth Error[/red]", border_style="red"
+            ))
+            sys.exit(1)
+    else:
+        LLM_PROVIDER = "Ollama"
+        LLM_MODEL = "mightykatun/qwen2.5-math:1.5b"
+        base_url = "http://localhost:11434/v1"
+        api_key = "ollama"
 
     llm_client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=OPENROUTER_API_KEY
+        base_url=base_url,
+        api_key=api_key
     )
 
     with console.status("[cyan]Connecting to vector DB...[/cyan]", spinner="dots"):
@@ -307,7 +327,10 @@ def show_splash(col, current_model):
     stats.add_column(style="bold cyan")
     stats.add_row("📚 Vector DB", f"{col.count()} chunks indexed")
     stats.add_row("🧠 LLM",       current_model)
-    stats.add_row("☁️  Cloud",     "OpenRouter (Free)")
+    if LLM_PROVIDER == "Ollama":
+        stats.add_row("🏠 Local",     "Ollama")
+    else:
+        stats.add_row("☁️  Cloud",     "OpenRouter (Free)")
     stats.add_row("🔍 Embeddings",EMBED_MODEL)
     stats.add_row("📐 Math",       "LaTeX + pattern detection ✓")
 
@@ -437,11 +460,12 @@ def show_answer(stream, turn: int, render_math: bool) -> str:
                 if hasattr(chunk, 'usage') and chunk.usage:
                     u = chunk.usage
                     stats_text = f"\n[dim white]Tokens: {u.prompt_tokens} prompt + {u.completion_tokens} completion. TTFT: {ttft:.2f}s.[/dim white]"
-                    renderables = live.get_renderable().renderables
+                    renderables = live.get_renderable().renderables if hasattr(live.get_renderable(), "renderables") else live.get_renderable()
                     if isinstance(renderables, tuple): 
                         renderables = list(renderables)
-                    renderables.append(Text.from_markup(stats_text))
-                    live.update(Padding(Group(*renderables), (0, 4)))
+                    if isinstance(renderables, list):
+                        renderables.append(Text.from_markup(stats_text))
+                        live.update(Group(*renderables))
                 continue
                 
             if ttft is None:
