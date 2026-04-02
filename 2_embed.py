@@ -13,7 +13,7 @@ from tqdm import tqdm
 CHUNKS_JSON  = "extracted/all_chunks.json"
 CHROMA_DIR   = "./chroma_db"
 COLLECTION   = "statics_8th_edition"
-EMBED_MODEL  = "all-MiniLM-L6-v2"
+EMBED_MODEL  = "BAAI/bge-small-en-v1.5"
 BATCH_SIZE   = 50
 
 # ─── SETUP ────────────────────────────────────────────────────────────────────
@@ -46,17 +46,23 @@ def build_embed_text(chunk: dict) -> str:
     source = chunk.get("source", "")
     text   = chunk.get("text", "").strip()
 
+    base = f"""
+Source: {source}
+Chapter: {ch}
+Topic: {topic}
+Problem ID: {pid}
+Content:
+{text}
+""".strip()
+
     if source == "question_bank":
-        return f"[QUESTION] {ch} | Topic: {topic}\nProblem {pid}\n{text}"
-
+        return f"{base}\nType: engineering mechanics statics question"
     elif source == "solution":
-        unit  = chunk.get("unit", "")
-        return f"[SOLUTION] {ch} | Unit {unit} | Topic: {topic}\nProblem {pid}\n{text}"
-
+        return f"{base}\nType: worked numerical solution with equations and steps"
     elif source == "textbook":
-        return f"[TEXTBOOK] {ch}\n{text}"
+        return f"{base}\nType: theory explanation, concepts, formulas, examples"
 
-    return text
+    return base
 
 
 def build_metadata(chunk: dict) -> dict:
@@ -69,7 +75,12 @@ def build_metadata(chunk: dict) -> dict:
         "topic":      chunk.get("topic") or "",
         "unit":       int(chunk.get("unit") or 0),
         "problem":    int(chunk.get("problem") or 0),
+        "chunk_index": int(chunk.get("chunk_index") or 0),
+        "chunk_type": chunk.get("chunk_type") or "",
+        "chapter_topic_key": f"{chunk.get('chapter','')}_{chunk.get('topic','')}".strip("_"),
     }
+    if chunk.get("page_count"):
+        meta["page_count"] = int(chunk["page_count"])
     # Source-specific extras
     if chunk.get("image_path"):
         meta["image_path"] = chunk["image_path"]

@@ -12,6 +12,12 @@ import os
 import sys
 import argparse
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # Suppress HuggingFace and transformers warnings
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -22,6 +28,9 @@ import chromadb
 from chromadb.utils import embedding_functions
 from openai import OpenAI
 import base64
+from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -40,7 +49,7 @@ from pylatexenc.latex2text import LatexNodes2Text
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 CHROMA_DIR   = "./chroma_db"
 COLLECTION   = "statics_8th_edition"
-EMBED_MODEL  = "all-MiniLM-L6-v2"
+EMBED_MODEL  = "BAAI/bge-small-en-v1.5"
 N_RESULTS    = 6
 MAX_HISTORY  = 10
 
@@ -264,7 +273,7 @@ def setup():
         LLM_PROVIDER = "OpenRouter"
         LLM_MODEL = "qwen/qwen3.6-plus-preview:free"
         base_url = "https://openrouter.ai/api/v1"
-        api_key = os.environ.get("OPENROUTER_API_KEY", "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")
+        api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
             console.print(Panel(
                 "[bold red]OPENROUTER_API_KEY not set![/bold red]\n\n"
@@ -387,24 +396,99 @@ def has_real_content(t: str) -> bool:
     return not any(m in t.lower() for m in NO_OCR)
 
 
+def dedupe_chunks(chunks):
+    seen = set()
+    unique = []
+
+    for c in chunks:
+        key = (
+            c["meta"].get("source"),
+            c["meta"].get("problem_id"),
+            c["meta"].get("page"),
+            c["meta"].get("chunk_index"),
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+
+    return unique
+
+def rerank_chunks(query, chunks, top_k=6):
+    if not chunks:
+        return chunks
+    pairs = [(query, c["text"]) for c in chunks]
+    scores = reranker.predict(pairs)
+
+    for c, s in zip(chunks, scores):
+        c["rerank_score"] = float(s)
+
+    chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
+    return chunks[:top_k]
+
 def retrieve(col, query, problem_id=None, topic=None):
-    where, n = None, N_RESULTS
+    final_chunks = []
+    
     if problem_id:
-        where, n = {"problem_id": {"$eq": problem_id}}, 10
-    elif topic:
+        exact = col.get(
+            where={"problem_id": {"$eq": problem_id}},
+            include=["documents", "metadatas"]
+        )
+        
+        if exact and exact["documents"]:
+            for d, m in zip(exact["documents"], exact["metadatas"]):
+                final_chunks.append({
+                    "text": d,
+                    "meta": m,
+                    "similarity": 1.0
+                })
+            
+            ch_num = None
+            if final_chunks:
+                ch_num = final_chunks[0]["meta"].get("ch_num")
+                
+            if ch_num:
+                theory = col.query(
+                    query_texts=[query],
+                    n_results=4,
+                    where={"source": {"$eq": "textbook"}},
+                    include=["documents", "metadatas", "distances"]
+                )
+                
+                if theory and theory["documents"] and len(theory["documents"]) > 0:
+                    for d, m, s in zip(theory["documents"][0], theory["metadatas"][0], theory["distances"][0]):
+                        if m.get("ch_num") == ch_num:
+                            final_chunks.append({
+                                "text": d,
+                                "meta": m,
+                                "similarity": round(1 - s, 3)
+                            })
+                            
+            final_chunks = dedupe_chunks(final_chunks)
+            order = {"solution": 0, "question_bank": 1, "textbook": 2}
+            final_chunks.sort(key=lambda x: order.get(x["meta"].get("source", ""), 3))
+            return final_chunks
+
+    where, n = None, 15
+    if topic:
         where = {"topic": {"$eq": topic}}
 
     res = col.query(
         query_texts=[query], n_results=n, where=where,
         include=["documents", "metadatas", "distances"]
     )
-    chunks = [
-        {"text": d, "meta": m, "similarity": round(1 - s, 3)}
-        for d, m, s in zip(res["documents"][0], res["metadatas"][0], res["distances"][0])
-    ]
+    if res and res["documents"] and len(res["documents"]) > 0:
+        for d, m, s in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
+            final_chunks.append({
+                "text": d,
+                "meta": m,
+                "similarity": round(1 - s, 3)
+            })
+            
+    final_chunks = dedupe_chunks(final_chunks)
+    final_chunks = rerank_chunks(query, final_chunks, top_k=N_RESULTS)
     order = {"solution": 0, "question_bank": 1, "textbook": 2}
-    chunks.sort(key=lambda x: order.get(x["meta"].get("source", ""), 3))
-    return chunks
+    final_chunks.sort(key=lambda x: order.get(x["meta"].get("source", ""), 3))
+    return final_chunks
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -547,8 +631,38 @@ Respond based on the type of user query:
 GENERAL RULES:
 - Never write huge walls of text; use whitespace and short paragraphs.
 - Be concise. Skip pleasantries. Do not repeat the question.
-- Rely on conversation history for follow-up questions."""
+- Rely on conversation history for follow-up questions.
 
+SOURCE PRIORITY:
+- If [SOLUTION] exists for the exact problem, trust it first.
+- Use [QUESTION BANK] to verify the exact problem statement.
+- Use [TEXTBOOK] for theory, formulas, and conceptual explanation.
+- If sources conflict, prefer exact problem-specific sources over general theory."""
+
+
+def compress_chunk_for_llm(chunk):
+    src = chunk["meta"].get("source", "?").upper().replace("_", " ")
+    pid = chunk["meta"].get("problem_id", "?")
+    topic = chunk["meta"].get("topic", "") or ""
+    text = chunk["text"].strip() if has_real_content(chunk["text"]) else "[Image only — OCR not run. Solve from question text.]"
+
+    # hard trim
+    if len(text) > 1800:
+        text = text[:1800] + "\n...[truncated]"
+
+    return f"--- {src} | {pid} | {topic} ---\n{text}"
+
+def detect_query_type(query: str) -> str:
+    q = query.lower()
+    if extract_problem_id(query):
+        return "problem"
+    if q.startswith("topic "):
+        return "topic"
+    if any(x in q for x in ["is this correct", "check", "verify"]):
+        return "verification"
+    if any(x in q for x in ["what is", "explain", "define", "why"]):
+        return "concept"
+    return "general"
 
 def generate(llm_client, query, chunks, history, current_model):
     sol_chunks = [c for c in chunks if c["meta"].get("source") == "solution"]
@@ -559,16 +673,9 @@ def generate(llm_client, query, chunks, history, current_model):
             border_style="yellow", padding=(0, 2)
         ))
 
-    ctx = []
+    ctx = [compress_chunk_for_llm(c) for c in chunks]
     image_contents = []
     for c in chunks:
-        src   = c["meta"].get("source","?").replace("_"," ").upper()
-        pid   = c["meta"].get("problem_id","?")
-        topic = c["meta"].get("topic","") or ""
-        text  = c["text"] if has_real_content(c["text"]) else \
-                "[Image only — OCR not run. Solve from question text.]"
-        ctx.append(f"--- {src} | {pid} | {topic} ---\n{text}")
-
         img_path = c["meta"].get("image_path")
         if img_path and os.path.exists(img_path):
             try:
@@ -584,7 +691,9 @@ def generate(llm_client, query, chunks, history, current_model):
                 pass
 
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    q_type = detect_query_type(query)
+    system_content = f"{SYSTEM_PROMPT}\n\nDetected Query Type: {q_type.upper()}"
+    messages = [{"role": "system", "content": system_content}]
     for turn in history[-MAX_HISTORY:]:
         messages.append(turn)
         

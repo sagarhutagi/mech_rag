@@ -32,7 +32,7 @@ SOLUTIONS_DIR  = os.path.join(SOURCE_DIR, "Solutions for QB")
 OUTPUT_DIR     = "extracted"
 IMAGES_DIR     = os.path.join(OUTPUT_DIR, "solution_images")
 
-VISION_MODEL   = "ministral-3:14b-cloud"    # or "llava" — for handwritten OCR
+VISION_MODEL   = "glm-ocr:latest"    # or "llava" — for handwritten OCR
 USE_VISION_OCR = True          # ← set True for full OCR pass (slow but accurate)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -101,20 +101,27 @@ def image_to_base64(img: Image.Image) -> str:
 
 def ocr_solution_page(img: Image.Image, problem_id: str, topic: str) -> str:
     b64 = image_to_base64(img)
-    prompt = f"""You are an expert OCR assistant for engineering mechanics solutions.
+    prompt = f"""You are extracting handwritten engineering mechanics solutions.
 
-Extract ALL content from this handwritten solution page.
-Problem: {problem_id}  |  Topic: {topic}
+Problem ID: {problem_id}
+Topic: {topic}
+
+Extract exactly what is visible on the page.
 
 Rules:
-- Extract all text exactly as written
-- Use LaTeX notation for equations: e.g. \\Sigma F_x = 0, 2000^2 = 1400^2 + 800^2, \\cos\\theta
-- Describe free body diagrams as: [FBD: brief description of geometry and forces shown]
-- Mark final underlined answers as: **ANSWER: value units**
-- Preserve solution flow: Given → Approach → Steps → Answer
-- Extract only what is on the page — do not add commentary
+- Preserve all equations and symbols
+- Convert equations into readable LaTeX-style text
+- Preserve units exactly
+- Preserve numbered steps if present
+- Describe diagrams as:
+  [FBD: ...]
+- Mark final answer lines as:
+  ANSWER: ...
+- If something is unclear, write [unclear]
+- Do not solve, infer, or add missing content
+- Do not explain anything
 
-Output:"""
+Output only the extracted content."""
 
     response = ollama.chat(
         model=VISION_MODEL,
@@ -220,6 +227,9 @@ def extract_all_solutions() -> list[dict]:
     print(f"\n  Found {len(all_pdfs)} solution PDFs")
     all_chunks = []
 
+    OCR_CACHE_DIR = os.path.join(OUTPUT_DIR, "ocr_cache")
+    os.makedirs(OCR_CACHE_DIR, exist_ok=True)
+
     for unit_dir, topic_dir, pdf_file in tqdm(all_pdfs, desc="Solutions"):
         topic_meta = parse_solution_folder(topic_dir.name)
         file_meta  = parse_solution_filename(pdf_file.name)
@@ -228,20 +238,35 @@ def extract_all_solutions() -> list[dict]:
         unit_num = int(unit_m.group(1)) if unit_m else topic_meta.get("unit", 0)
 
         safe_name = pdf_file.stem.replace(" ", "_")
-        img_path  = os.path.join(IMAGES_DIR, f"sol_{safe_name}.png")
 
         doc  = fitz.open(str(pdf_file))
-        page = doc[0]
-        img  = pdf_page_to_image(page, dpi=200)
-        img.save(img_path)
+        all_page_texts = []
+        all_image_paths = []
 
-        if USE_VISION_OCR:
-            ocr_text = ocr_solution_page(img, file_meta["problem_id"], topic_meta["topic"])
-        else:
-            native = page.get_text("text").strip()
-            ocr_text = native if native else "[Image — run with USE_VISION_OCR=True to extract]"
+        for page_idx in range(len(doc)):
+            page = doc[page_idx]
+            img = pdf_page_to_image(page, dpi=200)
 
-        doc.close()
+            page_img_path = os.path.join(IMAGES_DIR, f"sol_{safe_name}_p{page_idx+1}.png")
+            img.save(page_img_path)
+            all_image_paths.append(page_img_path)
+
+            if USE_VISION_OCR:
+                cache_file = os.path.join(OCR_CACHE_DIR, f"{safe_name}_p{page_idx+1}.txt")
+                if os.path.exists(cache_file):
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        page_text = f.read()
+                else:
+                    page_text = ocr_solution_page(img, file_meta["problem_id"], topic_meta["topic"])
+                    with open(cache_file, "w", encoding="utf-8") as f:
+                        f.write(page_text)
+            else:
+                native = page.get_text("text").strip()
+                page_text = native if native else "[Image — OCR not run]"
+            
+            all_page_texts.append(f"[PAGE {page_idx+1}]\n{page_text}")
+
+        ocr_text = "\n\n".join(all_page_texts)
 
         all_chunks.append({
             "problem_id":   file_meta["problem_id"],
@@ -255,13 +280,34 @@ def extract_all_solutions() -> list[dict]:
             "text":         ocr_text,
             "source":       "solution",
             "pdf_path":     str(pdf_file),
-            "image_path":   img_path,
+            "image_paths":  all_image_paths,
+            "page_count":   len(doc),
         })
+        
+        doc.close()
 
     return all_chunks
 
 
 # ─── SOURCE 3: TEXTBOOK ───────────────────────────────────────────────────────
+
+def split_textbook_text(text, max_chars=900, overlap=150):
+    paras = [p.strip() for p in text.split("\n") if p.strip()]
+    chunks = []
+    current = ""
+
+    for p in paras:
+        if len(current) + len(p) + 1 <= max_chars:
+            current += ("\n" if current else "") + p
+        else:
+            if current:
+                chunks.append(current)
+            current = current[-overlap:] + "\n" + p if current else p
+
+    if current:
+        chunks.append(current)
+
+    return chunks
 
 def extract_textbook() -> list[dict]:
     """
@@ -296,18 +342,22 @@ def extract_textbook() -> list[dict]:
                 f.write(base_image["image"])
             images_on_page.append(img_save)
 
-        chunks.append({
-            "problem_id":  f"tb_ch{current_chapter}_p{page_num+1}",
-            "ch_num":      str(current_chapter),
-            "chapter":     f"Chapter {current_chapter}",
-            "problem":     None,
-            "unit":        None,
-            "topic":       None,
-            "text":        text,
-            "source":      "textbook",
-            "page":        page_num + 1,
-            "image_paths": images_on_page,
-        })
+        subchunks = split_textbook_text(text)
+
+        for idx, sub in enumerate(subchunks):
+            chunks.append({
+                "problem_id": f"tb_ch{current_chapter}_p{page_num+1}_c{idx+1}",
+                "ch_num": str(current_chapter),
+                "chapter": f"Chapter {current_chapter}",
+                "problem": None,
+                "unit": None,
+                "topic": None,
+                "text": sub,
+                "source": "textbook",
+                "page": page_num + 1,
+                "chunk_index": idx + 1,
+                "image_paths": images_on_page,
+            })
 
     print(f"  Extracted {len(chunks)} textbook page chunks")
     return chunks
@@ -329,7 +379,7 @@ def cross_link(qb_chunks: list, sol_chunks: list) -> tuple[list, list]:
         pid = qb["problem_id"]
         if pid in sol_index:
             qb["has_solution"]       = True
-            qb["solution_image_path"] = sol_index[pid].get("image_path", "")
+            qb["solution_image_paths"] = sol_index[pid].get("image_paths", [])
             sol_index[pid]["has_question"] = True
             linked += 1
         else:

@@ -1,0 +1,79 @@
+# ─────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+venv/
+.env/
+.env.*
+
+# ─────────────────────────────────────────
+# OS / Editor junk
+# ─────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# ─────────────────────────────────────────
+# Logs
+# ─────────────────────────────────────────
+*.log
+
+# ─────────────────────────────────────────
+# Data / Outputs (VERY IMPORTANT)
+# ─────────────────────────────────────────
+# Extracted chunks & processed data
+extracted/
+*.json
+
+# ChromaDB (vector database)
+chroma_db/
+
+# OCR cache / images
+solution_images/
+ocr_cache/
+
+# Large files
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# ─────────────────────────────────────────
+# Model / AI artifacts
+# ─────────────────────────────────────────
+*.pt
+*.bin
+*.onnx
+*.ckpt
+
+# HuggingFace cache (optional)
+.cache/
+huggingface/
+
+# ─────────────────────────────────────────
+# Environment / Secrets
+# ─────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# API keys
+*.key
+secrets.json
+
+# ─────────────────────────────────────────
+# Misc
+# ─────────────────────────────────────────
+*.zip
+*.tar
+*.gz
+*.ipynb_checkpoints/
